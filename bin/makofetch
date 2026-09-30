@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# makofetch: Fast, zero-terminal system specs card using fastfetch & Mako
+# Author: Alice & Antigravity
+# License: MIT
+# Toggle with Mod+Shift+Backspace in niri
+# ==============================================================================
+
+ICON="/run/current-system/sw/share/icons/hicolor/128x128/apps/nix-snowflake.png"
+[ ! -f "$ICON" ] && ICON="nixos"
+
+# --- TOGGLE: If already displayed, dismiss it and exit ---
+if makoctl list 2>/dev/null | grep -q "App name: makofetch"; then
+    makoctl list 2>/dev/null | awk '
+        /^Notification [0-9]+:/ { id = $2; sub(":", "", id) }
+        /App name: makofetch/   { system("makoctl dismiss -n " id " 2>/dev/null") }
+    '
+    exit 0
+fi
+
+# --- GATHER & FORMAT SPECS ---
+# Use fastfetch to extract core system info quickly
+body=$(fastfetch --pipe --logo none -s OS:Host:Kernel:Uptime:WM:CPU:Memory:Disk:Battery 2>/dev/null | awk '
+match($0, /: /) {
+    key = substr($0, 1, RSTART - 1)
+    val = substr($0, RSTART + 2)
+    sub(/^Disk \(\/\)$/, "Disk", key)
+    sub(/^Battery.*$/, "Battery", key)
+    sub(/ \([0-9]+ hours?, [0-9]+ mins? remaining\)/, "", val)
+    sub(/Intel\(R\) Celeron\(R\) /, "", val)
+    printf "<b>%-7s</b> %s\n", key, val
+}')
+
+# Fallback if fastfetch produced empty output
+if [ -z "$body" ]; then
+    body="<b>OS</b>      $(uname -o) $(uname -r)
+<b>Host</b>    $(hostname)
+<b>Uptime</b>  $(uptime -p 2>/dev/null || uptime)"
+fi
+
+title="❄️ ${USER}@$(hostname)"
+
+# Push notification via D-Bus (timeout 8000ms, or toggle off earlier)
+busctl --user call org.freedesktop.Notifications /org/freedesktop/Notifications \
+    org.freedesktop.Notifications Notify susssasa{sv}i \
+    "makofetch" 0 "$ICON" "$title" "$body" 0 0 8000 >/dev/null 2>&1
+
+exit 0

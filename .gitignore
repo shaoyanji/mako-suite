@@ -1,0 +1,10 @@
+# Temporary runtime files
+*.pid
+*.nid
+*.dev
+*.tmp
+*~
+
+# OS artifacts
+.DS_Store
+Thumbs.db

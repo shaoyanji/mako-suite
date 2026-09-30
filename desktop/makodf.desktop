@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=💾 Disk Usage HUD (makodf)
+GenericName=Storage Monitor
+Comment=Storage and filesystem usage overview
+Exec=makodf
+Icon=drive-harddisk
+Terminal=false
+Categories=System;
+Keywords=df;disk;storage;space;duf;free;makodf;

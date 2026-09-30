@@ -1,0 +1,340 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# makodf: Ultra-lightweight disk usage HUD & duf-lite for Mako / Wayland
+# Author: Alice & Antigravity
+# License: MIT
+# Toggle with Mod+Ctrl+Backspace in niri
+# ==============================================================================
+
+APP_NAME="makodf"
+PID_FILE="/tmp/makodf.pid"
+NOTIF_ID_FILE="/tmp/makodf.nid"
+
+# ------------------------------------------------------------------------------
+# HELPER: Dismiss active makodf notification
+# ------------------------------------------------------------------------------
+dismiss_makodf() {
+    makoctl list 2>/dev/null | awk -v app="$APP_NAME" '
+        /^Notification [0-9]+:/ { id = $2; sub(":", "", id) }
+        $0 ~ ("App name: " app) { system("makoctl dismiss -n " id " 2>/dev/null") }
+    '
+}
+
+# ------------------------------------------------------------------------------
+# HELPER: Root filesystem free space for header
+# ------------------------------------------------------------------------------
+get_root_stat() {
+    local mode=$1
+    if [ "$mode" = "inodes" ]; then
+        df -kPi / 2>/dev/null | awk 'NR==2 {
+            fre = $4 + 0;
+            if (fre >= 1000000) printf "%.1fM", fre / 1000000;
+            else if (fre >= 1000) printf "%.1fK", fre / 1000;
+            else printf "%d", fre;
+        }'
+    else
+        df -kP / 2>/dev/null | awk 'NR==2 {
+            kib = $4 + 0;
+            if (kib >= 1073741824) printf "%.1fT", kib / 1073741824;
+            else if (kib >= 1048576) printf "%.1fG", kib / 1048576;
+            else if (kib >= 1024) printf "%.1fM", kib / 1024;
+            else printf "%dK", kib;
+        }'
+    fi
+}
+
+# ------------------------------------------------------------------------------
+# CORE: Generate formatted table (Pango for Mako, ANSI for CLI)
+# ------------------------------------------------------------------------------
+generate_table() {
+    local is_pango=$1
+    local mode=$2      # "blocks" or "inodes"
+    local show_all=$3  # 0 or 1
+
+    local df_cmd="df -kP -T"
+    [ "$mode" = "inodes" ] && df_cmd="df -kPi -T"
+
+    local filter="-x devtmpfs -x efivarfs -x squashfs -x overlay -x iso9660"
+    [ "$show_all" != "1" ] && filter="$filter -x tmpfs"
+
+    $df_cmd $filter 2>/dev/null | awk -v is_pango="$is_pango" -v mode="$mode" '
+    function human_bytes(kib) {
+        if (kib >= 1073741824) return sprintf("%.1fT", kib / 1073741824);
+        if (kib >= 1048576)    return sprintf("%.1fG", kib / 1048576);
+        if (kib >= 1024)       return sprintf("%.1fM", kib / 1024);
+        return sprintf("%dK", kib);
+    }
+    function human_count(n) {
+        if (n >= 1000000) return sprintf("%.1fM", n / 1000000);
+        if (n >= 1000)    return sprintf("%.1fK", n / 1000);
+        return sprintf("%d", n);
+    }
+    function make_bar(pct, width, is_pango) {
+        pct = pct + 0;
+        if (pct < 0) pct = 0;
+        if (pct > 100) pct = 100;
+        filled = int(pct * width / 100 + 0.5);
+        empty = width - filled;
+
+        # Catppuccin Mocha thresholds
+        if (pct < 65) {
+            col_hex = "#a6e3a1"; # Green
+            col_ansi = "\033[32m";
+        } else if (pct < 85) {
+            col_hex = "#fab387"; # Peach
+            col_ansi = "\033[33m";
+        } else {
+            col_hex = "#f38ba8"; # Red
+            col_ansi = "\033[31m";
+        }
+
+        fstr = ""; estr = "";
+        for (i = 0; i < filled; i++) fstr = fstr "█";
+        for (i = 0; i < empty; i++)  estr = estr "░";
+
+        if (is_pango) {
+            return sprintf("<span foreground=\"%s\">%s</span><span foreground=\"#45475a\">%s</span>", col_hex, fstr, estr);
+        } else {
+            return sprintf("%s%s\033[90m%s\033[0m", col_ansi, fstr, estr);
+        }
+    }
+    BEGIN {
+        h_usage = "USAGE";
+        h_pair  = (mode == "inodes" ? "IUSED/ITOTAL" : "USED/TOTAL");
+        h_free  = (mode == "inodes" ? "IFREE" : "FREE");
+
+        if (is_pango) {
+            printf "<span foreground=\"#6c7086\"><b>%-13s %-5s %-15s %-13s %7s</b></span>\n",
+                "MOUNT", "FS", h_usage, h_pair, h_free;
+        } else {
+            printf "\033[1;30m%-13s %-5s %-15s %-13s %7s\033[0m\n",
+                "MOUNT", "FS", h_usage, h_pair, h_free;
+        }
+    }
+    NR > 1 {
+        mp = $7;
+        for (i = 8; i <= NF; i++) mp = mp " " $i;
+
+        # Skip duplicate mount points or NixOS bind mounts on /
+        if (seen[mp]++) next;
+        if (mp == "/nix/store" && seen["/"]) next;
+
+        fs_type = $2;
+        pct_raw = $6; sub(/%/, "", pct_raw);
+        has_pct = (pct_raw != "-" && pct_raw != "");
+        pct = has_pct ? (pct_raw + 0) : 0;
+
+        if (mode == "inodes") {
+            tot = $3 + 0;
+            usd = $4 + 0;
+            fre = $5 + 0;
+            if (tot == 0) {
+                used_str = "-";
+                tot_str  = "-";
+                free_str = "-";
+            } else {
+                used_str = human_count(usd);
+                tot_str  = human_count(tot);
+                free_str = human_count(fre);
+            }
+        } else {
+            tot = $3 + 0;
+            usd = $4 + 0;
+            fre = $5 + 0;
+            used_str = human_bytes(usd);
+            tot_str  = human_bytes(tot);
+            free_str = human_bytes(fre);
+        }
+
+        # Truncate mountpoint if longer than 13 characters
+        mp_disp = mp;
+        if (length(mp_disp) > 13) {
+            mp_disp = "…" substr(mp_disp, length(mp_disp) - 11);
+        }
+
+        if (has_pct && tot > 0) {
+            bar = make_bar(pct, 7, is_pango);
+            pct_disp = sprintf("%2d%%", pct);
+        } else {
+            bar = (is_pango ? "<span foreground=\"#45475a\">░░░░░░░</span>" : "\033[90m░░░░░░░\033[0m");
+            pct_disp = " -- ";
+        }
+
+        pair_str = sprintf("%5s/%-5s", used_str, tot_str);
+
+        if (is_pango) {
+            printf "<b>%-13s</b> %-5s [%s] <b>%4s</b> %-13s <span foreground=\"#a6adc8\">%7s</span>\n",
+                mp_disp, fs_type, bar, pct_disp, pair_str, free_str;
+        } else {
+            printf "\033[1m%-13s\033[0m %-5s [%s] \033[1m%4s\033[0m %-13s \033[37m%7s\033[0m\n",
+                mp_disp, fs_type, bar, pct_disp, pair_str, free_str;
+        }
+    }'
+}
+
+# ------------------------------------------------------------------------------
+# PARSE CLI OPTIONS
+# ------------------------------------------------------------------------------
+WATCH_MODE=0
+INODES_MODE=0
+SHOW_ALL=0
+PRINT_MODE=0
+DAEMON_INTERNAL=0
+
+for arg in "$@"; do
+    case "$arg" in
+        --daemon)
+            DAEMON_INTERNAL=1
+            ;;
+        -w|--watch)
+            WATCH_MODE=1
+            ;;
+        -i|--inodes)
+            INODES_MODE=1
+            ;;
+        -a|--all)
+            SHOW_ALL=1
+            ;;
+        -p|--print)
+            PRINT_MODE=1
+            ;;
+        -d|--duf)
+            if command -v duf >/dev/null 2>&1; then
+                exec duf
+            else
+                echo "duf is not installed."
+                exit 1
+            fi
+            ;;
+        -h|--help)
+            echo "makodf - Ultra-lightweight disk usage HUD & duf-lite for Mako / Wayland"
+            echo ""
+            echo "Usage: makodf [OPTIONS]"
+            echo ""
+            echo "Options:"
+            echo "  (no args)     Toggle disk usage snapshot card (8s auto-dismiss)"
+            echo "  -w, --watch   Launch continuous live HUD (updates every 2s)"
+            echo "  -i, --inodes  Display inode counts & usage instead of disk blocks"
+            echo "  -a, --all     Show all filesystems including tmpfs"
+            echo "  -p, --print   Print formatted ANSI table to terminal"
+            echo "  -d, --duf     Run original duf terminal command if available"
+            echo "  -h, --help    Show this help message"
+            exit 0
+            ;;
+    esac
+done
+
+MODE="blocks"
+[ "$INODES_MODE" -eq 1 ] && MODE="inodes"
+
+# ------------------------------------------------------------------------------
+# TERMINAL PRINT MODE (-p / --print)
+# ------------------------------------------------------------------------------
+if [ "$PRINT_MODE" -eq 1 ]; then
+    root_free=$(get_root_stat "$MODE")
+    echo -e "\033[1;33m💾 makodf\033[0m • ${root_free} free on /"
+    generate_table 0 "$MODE" "$SHOW_ALL"
+    exit 0
+fi
+
+# ------------------------------------------------------------------------------
+# DAEMON MODE: Background sampler loop (invoked by --watch)
+# ------------------------------------------------------------------------------
+if [ "$DAEMON_INTERNAL" -eq 1 ]; then
+    cleanup() {
+        dismiss_makodf
+        rm -f "$PID_FILE" "$NOTIF_ID_FILE"
+        exit 0
+    }
+    trap cleanup SIGTERM SIGINT EXIT
+
+    notif_id=0
+    iteration=0
+
+    while true; do
+        # Auto-exit if notification was dismissed or clicked away by the user
+        if [ "$iteration" -gt 0 ]; then
+            if ! makoctl list 2>/dev/null | grep -q "App name: ${APP_NAME}"; then
+                cleanup
+            fi
+        fi
+
+        body=$(generate_table 1 "$MODE" "$SHOW_ALL")
+        root_free=$(get_root_stat "$MODE")
+        label="live"
+        [ "$MODE" = "inodes" ] && label="live-inodes"
+        title="💾 makodf [${label}] • ${root_free} free on /"
+
+        resp=$(busctl --user call org.freedesktop.Notifications /org/freedesktop/Notifications \
+            org.freedesktop.Notifications Notify susssasa{sv}i \
+            "$APP_NAME" "$notif_id" "" "$title" "$body" 0 0 0 2>/dev/null)
+
+        if [ $? -eq 0 ] && [[ "$resp" =~ u[[:space:]]+([0-9]+) ]]; then
+            notif_id="${BASH_REMATCH[1]}"
+            echo "$notif_id" > "$NOTIF_ID_FILE"
+        fi
+
+        iteration=$((iteration + 1))
+        sleep 2.0
+    done
+fi
+
+# ------------------------------------------------------------------------------
+# TOGGLE CONTROLLER: Check running daemon or visible card
+# ------------------------------------------------------------------------------
+
+# 1. Check PID file for running watch daemon
+if [ -f "$PID_FILE" ]; then
+    DAEMON_PID=$(cat "$PID_FILE" 2>/dev/null)
+    if [ -n "$DAEMON_PID" ] && kill -0 "$DAEMON_PID" 2>/dev/null; then
+        kill "$DAEMON_PID" 2>/dev/null
+        rm -f "$PID_FILE" "$NOTIF_ID_FILE"
+        dismiss_makodf
+        exit 0
+    fi
+fi
+
+# 2. Check process name fallback
+EXISTING_PID=$(pgrep -f "makodf --daemon" 2>/dev/null | head -n 1)
+if [ -n "$EXISTING_PID" ]; then
+    kill "$EXISTING_PID" 2>/dev/null
+    rm -f "$PID_FILE" "$NOTIF_ID_FILE"
+    dismiss_makodf
+    exit 0
+fi
+
+# 3. Check if card is currently displayed on screen (one-shot mode toggle off)
+if makoctl list 2>/dev/null | grep -q "App name: ${APP_NAME}"; then
+    dismiss_makodf
+    rm -f "$PID_FILE" "$NOTIF_ID_FILE"
+    exit 0
+fi
+
+# ------------------------------------------------------------------------------
+# LAUNCH CARD (Toggle ON)
+# ------------------------------------------------------------------------------
+dismiss_makodf
+
+if [ "$WATCH_MODE" -eq 1 ]; then
+    # Spawn background daemon for continuous monitoring
+    daemon_args="--daemon"
+    [ "$INODES_MODE" -eq 1 ] && daemon_args="$daemon_args --inodes"
+    [ "$SHOW_ALL" -eq 1 ] && daemon_args="$daemon_args --all"
+
+    nohup "$0" $daemon_args >/dev/null 2>&1 &
+    DAEMON_PID=$!
+    echo "$DAEMON_PID" > "$PID_FILE"
+    exit 0
+else
+    # One-shot notification card (8s timeout or toggle off with keybind)
+    body=$(generate_table 1 "$MODE" "$SHOW_ALL")
+    root_free=$(get_root_stat "$MODE")
+    label=""
+    [ "$MODE" = "inodes" ] && label=" [inodes]"
+    title="💾 makodf${label} • ${root_free} free on /"
+
+    busctl --user call org.freedesktop.Notifications /org/freedesktop/Notifications \
+        org.freedesktop.Notifications Notify susssasa{sv}i \
+        "$APP_NAME" 0 "" "$title" "$body" 0 0 8000 >/dev/null 2>&1
+    exit 0
+fi

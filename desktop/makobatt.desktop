@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=🔋 Battery HUD & Power (makobatt)
+GenericName=Power & Battery Manager
+Comment=Battery telemetry, power menu & low-battery sentinel
+Exec=makobatt
+Icon=battery
+Terminal=false
+Categories=System;Settings;
+Keywords=battery;power;reboot;shutdown;suspend;governor;makobatt;

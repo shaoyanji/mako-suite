@@ -1,0 +1,38 @@
+// ==============================================================================
+// mako-suite: Recommended Niri Keybindings & Autostart Snippet
+// Add inside ~/.config/niri/config.kdl
+// ==============================================================================
+
+// --- 1. Autostart Daemons ---
+// Starts Mako and the makobatt background battery sentinel (checks every 60s)
+spawn-at-startup "mako"
+spawn-at-startup "makobatt" "-s"
+
+// --- 2. Hotkey Clustered Binds (Inside binds { ... } block) ---
+// Ergonomically clustered around the BackSpace key:
+binds {
+    // makotop: Live CPU, RAM, and Swap HUD (toggles on/off)
+    Mod+BackSpace hotkey-overlay-title="Toggle CPU/RAM Monitor HUD (makotop)" {
+        spawn-sh "makotop"
+    }
+
+    // makofetch: Instant hardware and OS specs card
+    Mod+Shift+BackSpace hotkey-overlay-title="Show System Specs (makofetch)" {
+        spawn-sh "makofetch"
+    }
+
+    // makodf: Disk usage, mounted filesystems, and free space HUD
+    Mod+Ctrl+BackSpace hotkey-overlay-title="Show Disk Usage (makodf)" {
+        spawn-sh "makodf"
+    }
+
+    // makokill: Interactive process sniper & emergency kill HUD
+    Mod+Alt+BackSpace hotkey-overlay-title="Process Sniper & Panic HUD (makokill)" {
+        spawn-sh "makokill"
+    }
+
+    // makonet: Network telemetry, Wi-Fi details, and latency HUD
+    Mod+Shift+Ctrl+BackSpace hotkey-overlay-title="Network & Telemetry HUD (makonet)" {
+        spawn-sh "makonet"
+    }
+}

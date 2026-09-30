@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=🐧 System Specs (makofetch)
+GenericName=System Information Card
+Comment=Fastfetch system specifications and hardware overview
+Exec=makofetch
+Icon=help-about
+Terminal=false
+Categories=System;
+Keywords=fetch;specs;fastfetch;info;hardware;makofetch;

@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=📡 Network HUD (makonet)
+GenericName=Network & Wi-Fi Telemetry
+Comment=Zero-terminal network telemetry HUD & Wi-Fi selector
+Exec=makonet
+Icon=network-wireless
+Terminal=false
+Categories=System;Network;
+Keywords=network;wifi;ip;tailscale;ping;net;makonet;

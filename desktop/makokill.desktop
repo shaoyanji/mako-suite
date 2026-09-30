@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=🎯 Process Sniper (makokill)
+GenericName=Process Killer & Panic HUD
+Comment=Process sniper and emergency runaway killer
+Exec=makokill -k
+Icon=process-stop
+Terminal=false
+Categories=System;Monitor;
+Keywords=kill;sniper;panic;freeze;hog;process;makokill;

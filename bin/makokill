@@ -1,0 +1,355 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# makokill: Ultra-lightweight process sniper & panic HUD for Mako / Wayland
+# Author: Alice & Antigravity
+# License: MIT
+# Toggle with Mod+Alt+Backspace in niri
+# ==============================================================================
+
+APP_NAME="makokill"
+PID_FILE="/tmp/makokill.pid"
+NOTIF_ID_FILE="/tmp/makokill.nid"
+SELF_PID="$$"
+PARENT_PID="$PPID"
+
+# ------------------------------------------------------------------------------
+# NOTIFICATION HELPER
+# ------------------------------------------------------------------------------
+notify_msg() {
+    local title="$1"
+    local body="$2"
+    local timeout="${3:-3000}"
+    busctl --user call org.freedesktop.Notifications /org/freedesktop/Notifications \
+        org.freedesktop.Notifications Notify susssasa{sv}i \
+        "$APP_NAME" 0 "" "$title" "$body" 0 0 "$timeout" >/dev/null 2>&1 || true
+}
+
+dismiss_makokill() {
+    makoctl list 2>/dev/null | awk -v app="$APP_NAME" '
+        /^Notification [0-9]+:/ { id = $2; sub(":", "", id) }
+        $0 ~ ("App name: " app) { system("makoctl dismiss -n " id " 2>/dev/null") }
+    '
+}
+
+# ------------------------------------------------------------------------------
+# CLEAN STUCK AUDIO & LOCKFILES (pw-record)
+# ------------------------------------------------------------------------------
+clean_stuck() {
+    local killed=0
+    if pgrep -x "pw-record" >/dev/null 2>&1; then
+        pkill -9 -x "pw-record" 2>/dev/null || true
+        killed=1
+    fi
+    rm -f /tmp/voice_record.pid /tmp/voice_input.wav /tmp/voice_agent.pid /tmp/voice_agent_input.wav 2>/dev/null
+    pkill -RTMIN+8 waybar 2>/dev/null || true
+
+    if [ "$killed" -eq 1 ]; then
+        notify_msg "🎯 makokill" "🧹 Cleaned orphaned pw-record audio process & locks" 3000
+    else
+        notify_msg "🎯 makokill" "🧹 No orphaned audio recording processes found" 2000
+    fi
+}
+
+# ------------------------------------------------------------------------------
+# KILL TOP CPU HOG
+# ------------------------------------------------------------------------------
+kill_top() {
+    local top_proc
+    top_proc=$(ps -eo pid,ppid,%cpu,comm,args --sort=-%cpu --no-headers | awk \
+        -v self="$SELF_PID" -v parent="$PARENT_PID" '
+        {
+            if ($1 == self || $1 == parent || $2 == self || $2 == parent) next;
+            comm = $4;
+            args = ""; for (i = 5; i <= NF; i++) args = args " " $i;
+            if (comm ~ /^(ps|awk|head|sleep|makokill|fuzzel|grep)$/) next;
+            if (comm ~ /^(bash|sh)$/ && args ~ /(makokill|makotop|makofetch|makodf|waybar-voice|quick-keys|voice-dictate)/) next;
+
+            print $1, $4, $3;
+            exit;
+        }')
+
+    if [ -n "$top_proc" ]; then
+        read -r pid comm cpu <<< "$top_proc"
+        subcomm="${comm##*/}"
+        subcomm="${subcomm#.}"
+        subcomm="${subcomm%-wrapped}"
+
+        # Try SIGTERM first, fallback to SIGKILL
+        kill -15 "$pid" 2>/dev/null || kill -9 "$pid" 2>/dev/null
+        notify_msg "🎯 makokill" "⚡ Terminated top process: <b>${subcomm}</b> (PID ${pid}, ${cpu}% CPU)" 3500
+    else
+        notify_msg "🎯 makokill" "No active user processes found to terminate." 2000
+    fi
+}
+
+# ------------------------------------------------------------------------------
+# FUZZEL PROCESS SNIPER MENU
+# ------------------------------------------------------------------------------
+launch_fuzzel_sniper() {
+    dismiss_makokill
+
+    local options=""
+    local idx=1
+    while IFS='|' read -r pid cpu mem comm status; do
+        local label="${idx}. ${pid}: ${comm} (${cpu} CPU, ${mem} RAM)"
+        [ -n "$status" ] && label="${label} ── ${status}"
+        options="${options}${label}\n"
+        idx=$((idx + 1))
+    done < <(ps -eo pid,ppid,%cpu,rss,comm,args --sort=-%cpu --no-headers | awk \
+        -v self="$SELF_PID" -v parent="$PARENT_PID" '
+        {
+            if ($1 == self || $1 == parent || $2 == self || $2 == parent) next;
+            comm = $5;
+            args = ""; for (i = 6; i <= NF; i++) args = args " " $i;
+            if (comm ~ /^(ps|awk|head|sleep|makokill|fuzzel|grep)$/) next;
+            if (comm ~ /^(bash|sh)$/ && args ~ /(makokill|makotop|makofetch|makodf|waybar-voice|quick-keys|voice-dictate)/) next;
+
+            pid = $1;
+            cpu = $3 + 0;
+            rss_mb = int($4 / 1024 + 0.5);
+            sub(/^.*\//, "", comm);
+            sub(/^\./, "", comm);
+            sub(/-wrapped$/, "", comm);
+
+            status = "";
+            if (cpu >= 40) status = "⚠️ HOG";
+            if (comm == "pw-record") status = "⚠️ STUCK";
+
+            printf "%s|%4.1f%%|%dM|%s|%s\n", pid, cpu, rss_mb, comm, status;
+            count++;
+            if (count == 6) exit;
+        }')
+
+    options="${options}s. 🧹 Clean stuck audio processes (pw-record)"
+
+    local chosen
+    chosen=$(printf "%b" "$options" | fuzzel -d --minimal-lines -p "🎯 Snipe: ")
+
+    [ -z "$chosen" ] && exit 0
+
+    if [[ "$chosen" =~ ^[0-9]+\.[[:space:]]+([0-9]+):[[:space:]]+([^[:space:]]+) ]]; then
+        local target_pid="${BASH_REMATCH[1]}"
+        local target_name="${BASH_REMATCH[2]}"
+        kill -15 "$target_pid" 2>/dev/null || kill -9 "$target_pid" 2>/dev/null
+        notify_msg "🎯 makokill" "Terminated <b>${target_name}</b> (PID ${target_pid})" 3000
+    elif [[ "$chosen" =~ pw-record ]]; then
+        clean_stuck
+    fi
+    exit 0
+}
+
+# ------------------------------------------------------------------------------
+# GENERATE PROCESS TABLE (Pango for Mako, ANSI for CLI)
+# ------------------------------------------------------------------------------
+generate_table() {
+    local is_pango=$1
+
+    ps -eo pid,ppid,%cpu,rss,comm,args --sort=-%cpu --no-headers | awk \
+        -v is_pango="$is_pango" -v self="$SELF_PID" -v parent="$PARENT_PID" '
+    BEGIN {
+        if (is_pango) {
+            printf "<span foreground=\"#6c7086\"><b>%-6s   %-5s   %-5s   %-14s</b></span>\n",
+                "PID", "CPU", "RAM", "COMMAND";
+        } else {
+            printf "\033[1;30m%-6s   %-5s   %-5s   %-14s\033[0m\n",
+                "PID", "CPU", "RAM", "COMMAND";
+        }
+    }
+    {
+        if ($1 == self || $1 == parent || $2 == self || $2 == parent) next;
+        comm = $5;
+        args = ""; for (i = 6; i <= NF; i++) args = args " " $i;
+        if (comm ~ /^(ps|awk|head|sleep|makokill|fuzzel|grep)$/) next;
+        if (comm ~ /^(bash|sh)$/ && args ~ /(makokill|makotop|makofetch|makodf|waybar-voice|quick-keys|voice-dictate)/) next;
+
+        pid = $1;
+        cpu = $3 + 0;
+        rss_mb = int($4 / 1024 + 0.5);
+        sub(/^.*\//, "", comm);
+        sub(/^\./, "", comm);
+        sub(/-wrapped$/, "", comm);
+
+        # Truncate command name if too long
+        if (length(comm) > 13) comm = substr(comm, 1, 12) "…";
+
+        # Color thresholds
+        status = "";
+        if (cpu >= 40) {
+            col_hex = "#f38ba8"; # Red
+            col_ansi = "\033[31m";
+            status = " ⚠️ HOG";
+        } else if (cpu >= 15) {
+            col_hex = "#fab387"; # Peach
+            col_ansi = "\033[33m";
+        } else {
+            col_hex = "#a6e3a1"; # Green
+            col_ansi = "\033[32m";
+        }
+
+        if (comm == "pw-record") {
+            col_hex = "#f38ba8";
+            col_ansi = "\033[31m";
+            status = " ⚠️ STUCK";
+        }
+
+        if (is_pango) {
+            printf "<b>%-6s</b> <span foreground=\"%s\">%4.1f%%</span>  %4dM   %-13s<span foreground=\"#f38ba8\"><b>%s</b></span>\n",
+                pid, col_hex, cpu, rss_mb, comm, status;
+        } else {
+            printf "\033[1m%-6s\033[0m %s%4.1f%%\033[0m  %4dM   %-13s\033[31m%s\033[0m\n",
+                pid, col_ansi, cpu, rss_mb, comm, status;
+        }
+
+        count++;
+        if (count == 4) exit;
+    }'
+}
+
+# ------------------------------------------------------------------------------
+# PARSE CLI OPTIONS
+# ------------------------------------------------------------------------------
+WATCH_MODE=0
+PRINT_MODE=0
+DAEMON_INTERNAL=0
+
+for arg in "$@"; do
+    case "$arg" in
+        --daemon)
+            DAEMON_INTERNAL=1
+            ;;
+        -w|--watch)
+            WATCH_MODE=1
+            ;;
+        -k|--kill|--menu|--sniper)
+            launch_fuzzel_sniper
+            ;;
+        -9|--top|--kill-top)
+            kill_top
+            exit 0
+            ;;
+        -s|--stuck|--audio)
+            clean_stuck
+            exit 0
+            ;;
+        -p|--print)
+            PRINT_MODE=1
+            ;;
+        -h|--help)
+            echo "makokill - Ultra-lightweight process sniper & panic HUD for Mako / Wayland"
+            echo ""
+            echo "Usage: makokill [OPTIONS]"
+            echo ""
+            echo "Options:"
+            echo "  (no args)     Toggle Process HUD (Tap twice to open Fuzzel sniper)"
+            echo "  -k, --kill    Open interactive Fuzzel sniper menu directly"
+            echo "  -9, --top     Instantly terminate top CPU runaway process"
+            echo "  -s, --stuck   Clean orphaned audio recording (pw-record) processes & locks"
+            echo "  -w, --watch   Launch continuous live HUD (updates every 1.5s)"
+            echo "  -p, --print   Print process list to terminal stdout"
+            echo "  -h, --help    Show this help message"
+            exit 0
+            ;;
+    esac
+done
+
+# ------------------------------------------------------------------------------
+# TERMINAL PRINT MODE (-p / --print)
+# ------------------------------------------------------------------------------
+if [ "$PRINT_MODE" -eq 1 ]; then
+    echo -e "\033[1;31m🎯 makokill\033[0m • Process Sniper HUD"
+    generate_table 0
+    exit 0
+fi
+
+# ------------------------------------------------------------------------------
+# DAEMON MODE: Background sampler loop (invoked by --watch)
+# ------------------------------------------------------------------------------
+if [ "$DAEMON_INTERNAL" -eq 1 ]; then
+    cleanup() {
+        dismiss_makokill
+        rm -f "$PID_FILE" "$NOTIF_ID_FILE"
+        exit 0
+    }
+    trap cleanup SIGTERM SIGINT EXIT
+
+    notif_id=0
+    iteration=0
+
+    while true; do
+        if [ "$iteration" -gt 0 ]; then
+            if ! makoctl list 2>/dev/null | grep -q "App name: ${APP_NAME}"; then
+                cleanup
+            fi
+        fi
+
+        body=$(generate_table 1)
+        footer="<span foreground=\"#6c7086\"><i>Tap Mod+Alt+Backspace to snipe</i></span>"
+        title="🎯 makokill [live] • Process HUD"
+
+        resp=$(busctl --user call org.freedesktop.Notifications /org/freedesktop/Notifications \
+            org.freedesktop.Notifications Notify susssasa{sv}i \
+            "$APP_NAME" "$notif_id" "" "$title" "${body}\n${footer}" 0 0 0 2>/dev/null)
+
+        if [ $? -eq 0 ] && [[ "$resp" =~ u[[:space:]]+([0-9]+) ]]; then
+            notif_id="${BASH_REMATCH[1]}"
+            echo "$notif_id" > "$NOTIF_ID_FILE"
+        fi
+
+        iteration=$((iteration + 1))
+        sleep 1.5
+    done
+fi
+
+# ------------------------------------------------------------------------------
+# TOGGLE CONTROLLER
+# ------------------------------------------------------------------------------
+
+# 1. If live watch daemon is running: terminate it
+if [ -f "$PID_FILE" ]; then
+    DAEMON_PID=$(cat "$PID_FILE" 2>/dev/null)
+    if [ -n "$DAEMON_PID" ] && kill -0 "$DAEMON_PID" 2>/dev/null; then
+        kill "$DAEMON_PID" 2>/dev/null
+        rm -f "$PID_FILE" "$NOTIF_ID_FILE"
+        dismiss_makokill
+        exit 0
+    fi
+fi
+
+# 2. Check fallback daemon process
+EXISTING_PID=$(pgrep -f "makokill --daemon" 2>/dev/null | head -n 1)
+if [ -n "$EXISTING_PID" ]; then
+    kill "$EXISTING_PID" 2>/dev/null
+    rm -f "$PID_FILE" "$NOTIF_ID_FILE"
+    dismiss_makokill
+    exit 0
+fi
+
+# 3. If card is currently displayed on screen: Second tap opens Fuzzel sniper!
+if makoctl list 2>/dev/null | grep -q "App name: ${APP_NAME}"; then
+    dismiss_makokill
+    launch_fuzzel_sniper
+fi
+
+# 4. First tap: Show Process HUD card
+if [ "$WATCH_MODE" -eq 1 ]; then
+    nohup "$0" --daemon >/dev/null 2>&1 &
+    echo $! > "$PID_FILE"
+    exit 0
+else
+    body=$(generate_table 1)
+    footer="<span foreground=\"#6c7086\"><i>Tap Mod+Alt+Backspace again to snipe</i></span>"
+
+    # Check if there are runaway alerts for title
+    if echo "$body" | grep -q "HOG"; then
+        title="🎯 makokill • ⚠️ High CPU Alert"
+    elif echo "$body" | grep -q "STUCK"; then
+        title="🎯 makokill • ⚠️ Audio Loop Stuck"
+    else
+        title="🎯 makokill • Process HUD"
+    fi
+
+    busctl --user call org.freedesktop.Notifications /org/freedesktop/Notifications \
+        org.freedesktop.Notifications Notify susssasa{sv}i \
+        "$APP_NAME" 0 "" "$title" "${body}\n${footer}" 0 0 8000 >/dev/null 2>&1
+    exit 0
+fi

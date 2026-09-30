@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=⚡ System Monitor HUD (makotop)
+GenericName=System Monitor
+Comment=Live CPU, RAM and Swap telemetry HUD
+Exec=makotop
+Icon=utilities-system-monitor
+Terminal=false
+Categories=System;Monitor;
+Keywords=top;cpu;ram;swap;memory;monitor;makotop;

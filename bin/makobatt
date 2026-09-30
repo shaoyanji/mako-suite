@@ -1,0 +1,455 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# makobatt: Ultra-lightweight battery telemetry & power HUD for Mako / Wayland
+# Author: Alice & Antigravity
+# License: MIT
+# Toggle with Waybar battery click or CLI
+# ==============================================================================
+
+APP_NAME="makobatt"
+PID_FILE="/tmp/makobatt.pid"
+NOTIF_ID_FILE="/tmp/makobatt.nid"
+SENTINEL_PID_FILE="/tmp/makobatt_sentinel.pid"
+
+# ------------------------------------------------------------------------------
+# NOTIFICATION HELPERS
+# ------------------------------------------------------------------------------
+notify_msg() {
+    local title="$1"
+    local body="$2"
+    local timeout="${3:-3000}"
+    local urgency="${4:-normal}"
+    busctl --user call org.freedesktop.Notifications /org/freedesktop/Notifications \
+        org.freedesktop.Notifications Notify susssasa{sv}i \
+        "$APP_NAME" 0 "" "$title" "$body" 0 0 "$timeout" >/dev/null 2>&1 || true
+}
+
+dismiss_makobatt() {
+    makoctl list 2>/dev/null | awk -v app="$APP_NAME" '
+        /^Notification [0-9]+:/ { id = $2; sub(":", "", id) }
+        $0 ~ ("App name: " app) { system("makoctl dismiss -n " id " 2>/dev/null") }
+    '
+}
+
+# ------------------------------------------------------------------------------
+# FORMATTING HELPERS
+# ------------------------------------------------------------------------------
+make_bar() {
+    local pct="${1:-0}"
+    local width="${2:-10}"
+    local is_pango="$3"
+
+    pct=$(( pct + 0 ))
+    [ "$pct" -lt 0 ] && pct=0
+    [ "$pct" -gt 100 ] && pct=100
+
+    local filled=$(( (pct * width + 50) / 100 ))
+    [ "$filled" -gt "$width" ] && filled=$width
+    local empty=$(( width - filled ))
+
+    # Catppuccin Mocha thresholds
+    local col_hex="#a6e3a1"  # Green
+    local col_ansi="\033[32m"
+    if [ "$pct" -le 20 ]; then
+        col_hex="#f38ba8"    # Red
+        col_ansi="\033[31m"
+    elif [ "$pct" -le 40 ]; then
+        col_hex="#fab387"    # Peach
+        col_ansi="\033[33m"
+    fi
+
+    local fstr=""
+    local estr=""
+    for ((i = 0; i < filled; i++)); do fstr="${fstr}█"; done
+    for ((i = 0; i < empty; i++)); do estr="${estr}░"; done
+
+    if [ "$is_pango" -eq 1 ]; then
+        printf "<span foreground=\"%s\">%s</span><span foreground=\"#45475a\">%s</span>" "$col_hex" "$fstr" "$estr"
+    else
+        printf "%b%s\033[90m%s\033[0m" "$col_ansi" "$fstr" "$estr"
+    fi
+}
+
+# ------------------------------------------------------------------------------
+# CORE DATA EXTRACTION
+# ------------------------------------------------------------------------------
+gather_battery_data() {
+    local is_pango="$1"
+    local is_live="$2"
+
+    local bat_dir="/sys/class/power_supply/BAT1"
+    local adp_dir="/sys/class/power_supply/ADP1"
+
+    if [ ! -d "$bat_dir" ]; then
+        if [ "$is_pango" -eq 1 ]; then
+            echo "🔋 makobatt • No Battery"
+            echo "<span foreground=\"#f38ba8\">No battery found in /sys/class/power_supply/</span>"
+        else
+            echo -e "\033[1;31m🔋 makobatt • No Battery\033[0m"
+            echo "No battery found in /sys/class/power_supply/"
+        fi
+        return
+    fi
+
+    local cap status volt curr c_now c_full c_des cycles gov adp_online
+    cap=$(cat "$bat_dir/capacity" 2>/dev/null || echo 0)
+    status=$(cat "$bat_dir/status" 2>/dev/null || echo "Unknown")
+    volt=$(cat "$bat_dir/voltage_now" 2>/dev/null || echo 0)
+    curr=$(cat "$bat_dir/current_now" 2>/dev/null || echo 0)
+    c_now=$(cat "$bat_dir/charge_now" 2>/dev/null || echo 0)
+    c_full=$(cat "$bat_dir/charge_full" 2>/dev/null || echo 0)
+    c_des=$(cat "$bat_dir/charge_full_design" 2>/dev/null || echo 0)
+    cycles=$(cat "$bat_dir/cycle_count" 2>/dev/null || echo 0)
+    gov=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || echo "unknown")
+    adp_online=$(cat "$adp_dir/online" 2>/dev/null || echo 0)
+
+    # Calculations via awk
+    local calc_results
+    calc_results=$(awk -v cap="$cap" -v st="$status" -v v="$volt" -v c="$curr" \
+                       -v cn="$c_now" -v cf="$c_full" -v cd="$c_des" -v cyc="$cycles" '
+    BEGIN {
+        v_volts = v / 1000000;
+        c_amps  = c / 1000000;
+        watts   = v_volts * c_amps;
+        c_now_ah  = cn / 1000000;
+        c_full_ah = cf / 1000000;
+        c_des_ah  = cd / 1000000;
+
+        health_pct = (c_des_ah > 0 ? (c_full_ah / c_des_ah) * 100 : 100);
+        if (health_pct > 100) health_pct = 100;
+
+        # Time estimate
+        time_str = "";
+        if (st == "Discharging" && c > 0) {
+            h_raw = cn / c;
+            h = int(h_raw);
+            m = int((h_raw - h) * 60 + 0.5);
+            if (h > 0) time_str = sprintf("%dh %dm left", h, m);
+            else time_str = sprintf("%dm left", m);
+        } else if (st == "Charging" && c > 0) {
+            h_raw = (cf - cn) / c;
+            if (h_raw < 0) h_raw = 0;
+            h = int(h_raw);
+            m = int((h_raw - h) * 60 + 0.5);
+            if (h > 0) time_str = sprintf("%dh %dm to full", h, m);
+            else time_str = sprintf("%dm to full", m);
+        } else if (st == "Full") {
+            time_str = "Fully Charged";
+        } else {
+            time_str = "Calculating...";
+        }
+
+        printf "%.2f|%.2f|%.2f|%.2f|%.2f|%.1f|%s\n",
+            watts, v_volts, c_amps * 1000, c_full_ah, c_des_ah, health_pct, time_str;
+    }')
+
+    IFS='|' read -r watts v_volts c_ma c_full_ah c_des_ah health_pct time_str <<< "$calc_results"
+
+    local live_tag=""
+    [ "$is_live" -eq 1 ] && live_tag=" [live]"
+
+    local card_title="🔋 makobatt${live_tag} • ${status} (${cap}% • ${time_str})"
+    local bar_str
+    bar_str=$(make_bar "$cap" 10 "$is_pango")
+
+    local adp_str="ADP1 Disconnected (Battery mode)"
+    local adp_icon="○"
+    if [ "$adp_online" -eq 1 ]; then
+        adp_str="ADP1 Connected (AC power)"
+        adp_icon="●"
+    fi
+
+    if [ "$is_pango" -eq 1 ]; then
+        local cap_col="#a6e3a1"
+        [ "$cap" -le 40 ] && cap_col="#fab387"
+        [ "$cap" -le 20 ] && cap_col="#f38ba8"
+
+        local lvl_line="<span foreground=\"#f9e2af\"><b>LEVEL </b></span>  [${bar_str}] <span foreground=\"${cap_col}\"><b>${cap}%</b></span>  <span foreground=\"#a6adc8\">${watts}W • ${v_volts}V</span>"
+        local rate_line="<span foreground=\"#f9e2af\"><b>STATE </b></span>  <b>${status}</b>  <span foreground=\"#6c7086\">(</span>${c_ma} mA<span foreground=\"#6c7086\">)</span> • <span foreground=\"#a6adc8\">${time_str}</span>"
+        local hlth_line="<span foreground=\"#f9e2af\"><b>HEALTH</b></span>  <b>${health_pct}%</b>  <span foreground=\"#6c7086\">(</span>${c_full_ah}Ah / ${c_des_ah}Ah design • ${cycles} cycles<span foreground=\"#6c7086\">)</span>"
+        local ac_col="#6c7086"
+        [ "$adp_online" -eq 1 ] && ac_col="#a6e3a1"
+        local pwr_line="<span foreground=\"#f9e2af\"><b>POWER </b></span>  <span foreground=\"${ac_col}\">${adp_icon}</span> ${adp_str} • <span foreground=\"#a6adc8\">${gov}</span>"
+
+        echo "$card_title"
+        printf "%s\n%s\n%s\n%s" "$lvl_line" "$rate_line" "$hlth_line" "$pwr_line"
+    else
+        # ANSI
+        echo -e "\033[1;33m${card_title}\033[0m"
+        echo -e "\033[1;33mLEVEL \033[0m [${bar_str}] \033[1m${cap}%\033[0m  \033[90m${watts}W • ${v_volts}V\033[0m"
+        echo -e "\033[1;33mSTATE \033[0m \033[1m${status}\033[0m  \033[90m(${c_ma} mA) • ${time_str}\033[0m"
+        echo -e "\033[1;33mHEALTH\033[0m \033[1m${health_pct}%\033[0m  \033[90m(${c_full_ah}Ah / ${c_des_ah}Ah • ${cycles} cycles)\033[0m"
+        local ac_ansi="\033[90m○\033[0m"
+        [ "$adp_online" -eq 1 ] && ac_ansi="\033[32m●\033[0m"
+        echo -e "\033[1;33mPOWER \033[0m ${ac_ansi} ${adp_str} • \033[90m${gov}\033[0m"
+    fi
+}
+
+# ------------------------------------------------------------------------------
+# CPU GOVERNOR TOGGLE
+# ------------------------------------------------------------------------------
+toggle_governor() {
+    local cur_gov
+    cur_gov=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || echo "schedutil")
+    local new_gov="schedutil"
+    [ "$cur_gov" = "schedutil" ] && new_gov="performance"
+
+    # 1. Try writing directly first (succeeds if permissions were previously cached or set)
+    local can_write=1
+    for f in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
+        if ! echo "$new_gov" > "$f" 2>/dev/null; then
+            can_write=0
+            break
+        fi
+    done
+
+    if [ "$can_write" -eq 1 ]; then
+        notify_msg "⚡ CPU Governor" "Switched to: <b>${new_gov}</b>" 2500
+        return 0
+    fi
+
+    # 2. If direct write failed, prompt via Fuzzel for sudo password
+    local pass
+    pass=$(fuzzel -d --password -p "🔑 Sudo password for CPU governor: " -w 45)
+    [ -z "$pass" ] && return 1
+
+    # 3. Apply governor and make nodes writable by 'users' group for passwordless future toggles
+    local sudo_err
+    if sudo_err=$(echo "$pass" | sudo -S bash -c "
+        for f in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
+            echo '$new_gov' > \"\$f\"
+            chown root:users \"\$f\"
+            chmod 664 \"\$f\"
+        done
+    " 2>&1); then
+        local msg="Switched to: <b>${new_gov}</b>
+<span foreground=\"#a6adc8\">Permissions cached for this boot</span>"
+        notify_msg "⚡ CPU Governor" "$msg" 3500
+    else
+        local err_msg="Failed to switch governor:
+${sudo_err}"
+        notify_msg "⚡ CPU Governor Error" "$err_msg" 4000
+    fi
+}
+
+# ------------------------------------------------------------------------------
+# FUZZEL POWER & SYSTEM MENU (-m / --menu)
+# ------------------------------------------------------------------------------
+launch_fuzzel_power_menu() {
+    dismiss_makobatt
+
+    local cur_gov
+    cur_gov=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || echo "schedutil")
+    local next_gov="performance"
+    [ "$cur_gov" = "performance" ] && next_gov="schedutil"
+
+    local options="🔒 Lock Screen (swaylock)\n💤 Suspend to RAM\n🔄 Reboot System\n⚡ Power Off\n🔋 View Battery Report\n⚙️ CPU Governor: ${cur_gov} ──> Switch to ${next_gov}"
+
+    local choice
+    choice=$(echo -e "$options" | fuzzel -d -p "⚡ Power Menu > " -w 48 -l 6)
+    [ -z "$choice" ] && exit 0
+
+    case "$choice" in
+        "🔒 Lock Screen (swaylock)")
+            swaylock -f
+            ;;
+        "💤 Suspend to RAM")
+            systemctl suspend
+            ;;
+        "🔄 Reboot System")
+            systemctl reboot
+            ;;
+        "⚡ Power Off")
+            systemctl poweroff
+            ;;
+        "🔋 View Battery Report")
+            "$0"
+            ;;
+        *"CPU Governor"*)
+            toggle_governor
+            ;;
+    esac
+    exit 0
+}
+
+# ------------------------------------------------------------------------------
+# BACKGROUND SENTINEL MODE (-s / --sentinel)
+# ------------------------------------------------------------------------------
+run_sentinel() {
+    local alerted_20=0
+    local alerted_10=0
+    local alerted_5=0
+
+    while true; do
+        local bat_dir="/sys/class/power_supply/BAT1"
+        local adp_dir="/sys/class/power_supply/ADP1"
+
+        if [ -d "$bat_dir" ]; then
+            local cap status adp_online
+            cap=$(cat "$bat_dir/capacity" 2>/dev/null || echo 100)
+            status=$(cat "$bat_dir/status" 2>/dev/null || echo "Unknown")
+            adp_online=$(cat "$adp_dir/online" 2>/dev/null || echo 0)
+
+            if [ "$status" = "Discharging" ]; then
+                if [ "$cap" -le 5 ] && [ "$alerted_5" -eq 0 ]; then
+                    notify_msg "🛑 BATTERY CRITICAL: 5%!" "System is about to shut down. Connect AC charger immediately!" 10000 "critical"
+                    pw-play /run/current-system/sw/share/sounds/freedesktop/stereo/alarm-clock-elapsed.oga 2>/dev/null || true
+                    alerted_5=1
+                elif [ "$cap" -le 10 ] && [ "$alerted_10" -eq 0 ]; then
+                    notify_msg "🚨 Low Battery Warning: 10%!" "Battery is critically low. Connect AC power." 8000 "critical"
+                    pw-play /run/current-system/sw/share/sounds/freedesktop/stereo/dialog-warning.oga 2>/dev/null || true
+                    alerted_10=1
+                elif [ "$cap" -le 20 ] && [ "$alerted_20" -eq 0 ]; then
+                    notify_msg "⚠️ Battery Level: 20%" "Please connect power soon." 5000 "normal"
+                    pw-play /run/current-system/sw/share/sounds/freedesktop/stereo/bell.oga 2>/dev/null || true
+                    alerted_20=1
+                fi
+            else
+                # Reset alerts when charging or full
+                if [ "$alerted_20" -eq 1 ] || [ "$alerted_10" -eq 1 ] || [ "$alerted_5" -eq 1 ]; then
+                    notify_msg "🔌 AC Power Connected" "Battery is now ${status,,} (${cap}%)." 3000 "normal"
+                    pw-play /run/current-system/sw/share/sounds/freedesktop/stereo/complete.oga 2>/dev/null || true
+                fi
+                alerted_20=0
+                alerted_10=0
+                alerted_5=0
+            fi
+        fi
+        sleep 60
+    done
+}
+
+# ------------------------------------------------------------------------------
+# PARSE CLI OPTIONS
+# ------------------------------------------------------------------------------
+WATCH_MODE=0
+PRINT_MODE=0
+MENU_MODE=0
+DAEMON_INTERNAL=0
+SENTINEL_MODE=0
+
+for arg in "$@"; do
+    case "$arg" in
+        --daemon)
+            DAEMON_INTERNAL=1
+            ;;
+        -w|--watch)
+            WATCH_MODE=1
+            ;;
+        -p|--print)
+            PRINT_MODE=1
+            ;;
+        -m|--menu)
+            MENU_MODE=1
+            ;;
+        -g|--governor)
+            toggle_governor
+            exit 0
+            ;;
+        -s|--sentinel)
+            SENTINEL_MODE=1
+            ;;
+        -h|--help)
+            echo "makobatt - Ultra-lightweight battery telemetry & power HUD for Mako / Wayland"
+            echo ""
+            echo "Usage: makobatt [OPTIONS]"
+            echo ""
+            echo "Options:"
+            echo "  (no args)     Toggle battery snapshot card (8s auto-dismiss)"
+            echo "  -w, --watch   Continuous live HUD (updates every 2s via D-Bus)"
+            echo "  -p, --print   Print formatted ANSI telemetry to terminal"
+            echo "  -m, --menu    Launch interactive Fuzzel power menu (Lock, Suspend, Poweroff)"
+            echo "  -g, --governor Toggle CPU governor between schedutil and performance"
+            echo "  -s, --sentinel Run background battery watcher for low-battery alerts"
+            echo "  -h, --help    Show this help message"
+            exit 0
+            ;;
+    esac
+done
+
+if [ "$SENTINEL_MODE" -eq 1 ]; then
+    run_sentinel
+    exit 0
+fi
+
+if [ "$MENU_MODE" -eq 1 ]; then
+    launch_fuzzel_power_menu
+fi
+
+if [ "$PRINT_MODE" -eq 1 ]; then
+    gather_battery_data 0 0
+    exit 0
+fi
+
+if [ "$DAEMON_INTERNAL" -eq 1 ]; then
+    cleanup() {
+        dismiss_makobatt
+        rm -f "$PID_FILE" "$NOTIF_ID_FILE"
+        exit 0
+    }
+    trap cleanup SIGTERM SIGINT EXIT
+
+    notif_id=0
+    iteration=0
+
+    while true; do
+        if [ "$iteration" -gt 0 ]; then
+            if ! makoctl list 2>/dev/null | grep -q "App name: ${APP_NAME}"; then
+                cleanup
+            fi
+        fi
+
+        output=$(gather_battery_data 1 1)
+        title=$(head -n 1 <<< "$output")
+        body=$(tail -n +2 <<< "$output")
+
+        resp=$(busctl --user call org.freedesktop.Notifications /org/freedesktop/Notifications \
+            org.freedesktop.Notifications Notify susssasa{sv}i \
+            "$APP_NAME" "$notif_id" "" "$title" "$body" 0 0 0 2>/dev/null)
+
+        if [ $? -eq 0 ] && [[ "$resp" =~ u[[:space:]]+([0-9]+) ]]; then
+            notif_id="${BASH_REMATCH[1]}"
+            echo "$notif_id" > "$NOTIF_ID_FILE"
+        fi
+
+        iteration=$((iteration + 1))
+        sleep 2.0
+    done
+fi
+
+# ------------------------------------------------------------------------------
+# TOGGLE CONTROLLER
+# ------------------------------------------------------------------------------
+if [ -f "$PID_FILE" ]; then
+    DAEMON_PID=$(cat "$PID_FILE" 2>/dev/null)
+    if [ -n "$DAEMON_PID" ] && kill -0 "$DAEMON_PID" 2>/dev/null; then
+        kill "$DAEMON_PID" 2>/dev/null
+        rm -f "$PID_FILE" "$NOTIF_ID_FILE"
+        dismiss_makobatt
+        exit 0
+    fi
+fi
+
+if makoctl list 2>/dev/null | grep -q "App name: ${APP_NAME}"; then
+    dismiss_makobatt
+    rm -f "$PID_FILE" "$NOTIF_ID_FILE"
+    exit 0
+fi
+
+dismiss_makobatt
+
+if [ "$WATCH_MODE" -eq 1 ]; then
+    nohup "$0" --daemon >/dev/null 2>&1 &
+    DAEMON_PID=$!
+    echo "$DAEMON_PID" > "$PID_FILE"
+    exit 0
+else
+    output=$(gather_battery_data 1 0)
+    title=$(head -n 1 <<< "$output")
+    body=$(tail -n +2 <<< "$output")
+
+    busctl --user call org.freedesktop.Notifications /org/freedesktop/Notifications \
+        org.freedesktop.Notifications Notify susssasa{sv}i \
+        "$APP_NAME" 0 "" "$title" "$body" 0 0 8000 >/dev/null 2>&1
+    exit 0
+fi
